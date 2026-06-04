@@ -141,8 +141,27 @@ class CSIControllerServicer(csi_pb2_grpc.ControllerServicer):
                                                                        source_type, required_bytes)
                 volume.source_id = source_id
 
+                # Extract encryption parameters from request
+                volume_context = {}
+                encrypted = request.parameters.get(servers_settings.PARAMETERS_ENCRYPTED, "false")
+
+                if encrypted == "true":
+                    encryption_secret = request.parameters.get(servers_settings.PARAMETERS_ENCRYPTION_SECRET)
+                    encryption_secret_namespace = request.parameters.get(servers_settings.PARAMETERS_ENCRYPTION_SECRET_NAMESPACE)
+
+                    if not encryption_secret or not encryption_secret_namespace:
+                        message = "Encryption enabled but encryptionSecret or encryptionSecretNamespace not provided"
+                        return build_error_response(message, context, grpc.StatusCode.INVALID_ARGUMENT,
+                                                    csi_pb2.CreateVolumeResponse)
+
+                    volume_context["encrypted"] = "true"
+                    volume_context["encryptionSecret"] = encryption_secret
+                    volume_context["encryptionSecretNamespace"] = encryption_secret_namespace
+                    logger.info("Volume {} will be encrypted using secret {}/{}".format(
+                        volume_final_name, encryption_secret_namespace, encryption_secret))
+
                 response = utils.generate_csi_create_volume_response(volume, array_connection_info.system_id,
-                                                                     source_type)
+                                                                     source_type, volume_context)
                 return response
         except (array_errors.InvalidArgumentError, array_errors.ExpectedSnapshotButFoundVolumeError) as ex:
             return handle_exception(ex, context, grpc.StatusCode.INVALID_ARGUMENT, csi_pb2.CreateVolumeResponse)

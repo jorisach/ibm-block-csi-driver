@@ -28,6 +28,7 @@ import (
 	"github.com/ibm/ibm-block-csi-driver/node/logger"
 	"github.com/ibm/ibm-block-csi-driver/node/pkg/driver/device_connectivity"
 	"github.com/ibm/ibm-block-csi-driver/node/pkg/driver/executer"
+	"github.com/ibm/ibm-block-csi-driver/node/pkg/driver/luks"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	mount "k8s.io/mount-utils"
@@ -72,6 +73,16 @@ type NodeMounter interface {
 	GetDiskFormat(disk string) (string, error)
 }
 
+// LuksInterface is an alias for luks.LuksInterface to allow mocking
+type LuksInterface interface {
+	LuksFormat(devicePath string, passphrase string) error
+	LuksOpen(devicePath string, volumeID string, passphrase string) (string, error)
+	LuksClose(volumeID string) error
+	LuksResize(volumeID string) error
+	LuksStatus(volumeID string) (bool, error)
+	IsLuks(devicePath string) (bool, error)
+}
+
 // nodeService represents the node service of CSI driver
 type NodeService struct {
 	// csi.NodeServer
@@ -83,6 +94,7 @@ type NodeService struct {
 	VolumeIdLocksMap            SyncLockInterface
 	OsDeviceConnectivityMapping map[string]device_connectivity.OsDeviceConnectivityInterface
 	OsDeviceConnectivityHelper  device_connectivity.OsDeviceConnectivityHelperScsiGenericInterface
+	LuksManager                 LuksInterface
 }
 
 type VolumeStatistics struct {
@@ -95,7 +107,7 @@ type VolumeStatistics struct {
 func NewNodeService(configYaml ConfigFile, hostname string, nodeUtils NodeUtilsInterface,
 	OsDeviceConnectivityMapping map[string]device_connectivity.OsDeviceConnectivityInterface,
 	osDeviceConnectivityHelper device_connectivity.OsDeviceConnectivityHelperScsiGenericInterface,
-	executer executer.ExecuterInterface, mounter NodeMounter, syncLock SyncLockInterface) NodeService {
+	executer executer.ExecuterInterface, mounter NodeMounter, syncLock SyncLockInterface, luksManager LuksInterface) NodeService {
 	return NodeService{
 		ConfigYaml:                  configYaml,
 		Hostname:                    hostname,
@@ -105,6 +117,7 @@ func NewNodeService(configYaml ConfigFile, hostname string, nodeUtils NodeUtilsI
 		OsDeviceConnectivityHelper:  osDeviceConnectivityHelper,
 		Mounter:                     mounter,
 		VolumeIdLocksMap:            syncLock,
+		LuksManager:                 luksManager,
 	}
 }
 
@@ -166,12 +179,84 @@ func (d *NodeService) NodeStageVolume(ctx context.Context, req *csi.NodeStageVol
 		return nil, status.Error(codes.Internal, err.Error())
 	}
 
+	// Handle LUKS encryption if requested
+	deviceToUse := mpathDevice
+	volumeContext := req.GetVolumeContext()
+	encrypted := volumeContext["encrypted"]
+
+	if encrypted == "true" {
+		logger.Infof("Volume %s is marked for encryption", volumeID)
+
+		secretName := volumeContext["encryptionSecret"]
+		secretNamespace := volumeContext["encryptionSecretNamespace"]
+
+		if secretName == "" || secretNamespace == "" {
+			return nil, status.Error(codes.InvalidArgument, "encrypted volume requires encryptionSecret and encryptionSecretNamespace in volume context")
+		}
+
+		// Retrieve passphrase from Kubernetes secret
+		passphrase, err := luks.GetEncryptionPassphrase(ctx, secretName, secretNamespace)
+		if err != nil {
+			logger.Errorf("Failed to retrieve encryption passphrase: %v", err)
+			return nil, status.Errorf(codes.InvalidArgument, "failed to retrieve passphrase: %v", err)
+		}
+		defer luks.ClearPassphrase(&passphrase)
+
+		// Check if device is already LUKS formatted (idempotency)
+		isLuks, err := d.LuksManager.IsLuks(mpathDevice)
+		if err != nil {
+			logger.Errorf("Failed to check if device is LUKS formatted: %v", err)
+			return nil, status.Errorf(codes.Internal, "failed to check LUKS format: %v", err)
+		}
+
+		if !isLuks {
+			// SAFETY CHECK: Verify device is empty before formatting with LUKS
+			// This prevents accidental data loss from encrypting volumes with existing data
+			isEmpty, err := luks.IsDeviceEmpty(mpathDevice)
+			if err != nil {
+				logger.Errorf("Failed to check if device is empty: %v", err)
+				return nil, status.Errorf(codes.Internal, "failed to verify device state: %v", err)
+			}
+
+			if !isEmpty {
+				// Device contains data - refuse to encrypt to prevent data loss
+				logger.Errorf("Cannot encrypt device %s: device contains existing data", mpathDevice)
+				return nil, status.Error(codes.FailedPrecondition,
+					"cannot encrypt volume: device contains existing data. "+
+						"LUKS encryption can only be applied to new, empty volumes. "+
+						"To encrypt existing data, create a new encrypted PVC and migrate your data.")
+			}
+
+			// Device is empty and safe to format
+			logger.Infof("Device %s is empty, formatting with LUKS encryption", mpathDevice)
+			err = d.LuksManager.LuksFormat(mpathDevice, passphrase)
+			if err != nil {
+				logger.Errorf("Failed to format device with LUKS: %v", err)
+				return nil, status.Errorf(codes.Internal, "failed to format volume with LUKS: %v", err)
+			}
+		} else {
+			logger.Infof("Device %s is already LUKS formatted", mpathDevice)
+		}
+
+		// Open LUKS device
+		mapperDevice, err := d.LuksManager.LuksOpen(mpathDevice, volumeID, passphrase)
+		if err != nil {
+			logger.Errorf("Failed to open LUKS device: %v", err)
+			return nil, status.Errorf(codes.Internal, "failed to open encrypted volume: %v", err)
+		}
+
+		logger.Infof("LUKS device opened at %s", mapperDevice)
+		deviceToUse = mapperDevice
+	}
+
 	volumeCap := req.GetVolumeCapability()
 	switch volumeCap.GetAccessType().(type) {
 	case *csi.VolumeCapability_Block:
-		logger.Debugf("NodeStageVolume Finished: multipath device [%s] is ready to be mounted by NodePublishVolume API", mpathDevice)
+		logger.Debugf("NodeStageVolume Finished: device [%s] is ready to be mounted by NodePublishVolume API", deviceToUse)
 		return &csi.NodeStageVolumeResponse{}, nil
 	}
+	// For encrypted volumes, we need to validate against the underlying mpath device
+	// but format/mount against the LUKS mapper device
 	baseDevice := path.Base(mpathDevice)
 	sysDevices, err := d.NodeUtils.GetSysDevicesFromMpath(baseDevice)
 	if err != nil {
@@ -184,7 +269,7 @@ func (d *NodeService) NodeStageVolume(ctx context.Context, req *csi.NodeStageVol
 		return nil, status.Error(codes.Internal, err.Error())
 	}
 
-	existingFormat, err := d.Mounter.GetDiskFormat(mpathDevice)
+	existingFormat, err := d.Mounter.GetDiskFormat(deviceToUse)
 	if err != nil {
 		logger.Errorf("Could not determine if disk {%v} is formatted, error: %v", mpathDevice, err)
 		return nil, status.Error(codes.Internal, err.Error())
@@ -210,7 +295,7 @@ func (d *NodeService) NodeStageVolume(ctx context.Context, req *csi.NodeStageVol
 		return &csi.NodeStageVolumeResponse{}, nil
 	}
 
-	err = d.formatAndMount(mpathDevice, stagingPath, fsTypeForMount, existingFormat)
+	err = d.formatAndMount(deviceToUse, stagingPath, fsTypeForMount, existingFormat)
 	if err != nil {
 		return nil, status.Error(codes.Internal, err.Error())
 	}
@@ -363,6 +448,21 @@ func (d *NodeService) NodeUnstageVolume(ctx context.Context, req *csi.NodeUnstag
 		if err != nil {
 			logger.Errorf("Unmount failed. Target : %q, err : %v", stagingTargetPath, err.Error())
 			return nil, status.Error(codes.Internal, err.Error())
+		}
+	}
+
+	// Check if volume is encrypted and close LUKS device
+	isActive, err := d.LuksManager.LuksStatus(volumeID)
+	if err != nil {
+		logger.Warningf("Failed to check LUKS status for volume %s: %v", volumeID, err)
+		// Continue with cleanup even if status check fails
+	} else if isActive {
+		logger.Infof("Closing LUKS device for volume %s", volumeID)
+		err = d.LuksManager.LuksClose(volumeID)
+		if err != nil {
+			logger.Warningf("Failed to close LUKS device for volume %s: %v", volumeID, err)
+			// Continue with multipath cleanup even if LUKS close fails
+			// The mapper will be cleaned up on reboot if needed
 		}
 	}
 
@@ -804,9 +904,28 @@ func (d *NodeService) NodeExpandVolume(ctx context.Context, req *csi.NodeExpandV
 		return nil, status.Errorf(codes.Internal, "Unknown NVMe type for device %s", baseDevice)
 	}
 
-	existingFormat, err := d.Mounter.GetDiskFormat(device)
+	// Check if volume is encrypted and resize LUKS device
+	deviceToExpand := device
+	isActive, err := d.LuksManager.LuksStatus(volumeID)
 	if err != nil {
-		logger.Errorf("Could not determine if disk {%v} is formatted, error: %v", device, err)
+		logger.Warningf("Failed to check LUKS status for volume %s: %v", volumeID, err)
+		// Continue without LUKS resize if status check fails
+	} else if isActive {
+		logger.Infof("Resizing LUKS device for volume %s", volumeID)
+		err = d.LuksManager.LuksResize(volumeID)
+		if err != nil {
+			logger.Errorf("Failed to resize LUKS device: %v", err)
+			return nil, status.Errorf(codes.Internal, "failed to resize LUKS volume: %v", err)
+		}
+		// Use the mapper device path for filesystem expansion
+		mapperPath := fmt.Sprintf("/dev/mapper/ibm_%s", strings.ReplaceAll(volumeID, ":", "_"))
+		deviceToExpand = mapperPath
+		logger.Infof("LUKS device resized, using mapper device: %s", deviceToExpand)
+	}
+
+	existingFormat, err := d.Mounter.GetDiskFormat(deviceToExpand)
+	if err != nil {
+		logger.Errorf("Could not determine if disk {%v} is formatted, error: %v", deviceToExpand, err)
 		return nil, status.Error(codes.Internal, err.Error())
 	}
 
@@ -815,7 +934,7 @@ func (d *NodeService) NodeExpandVolume(ctx context.Context, req *csi.NodeExpandV
 		mountPointToExpand = req.GetVolumePath()
 	}
 
-	err = d.NodeUtils.ExpandFilesystem(device, mountPointToExpand, existingFormat)
+	err = d.NodeUtils.ExpandFilesystem(deviceToExpand, mountPointToExpand, existingFormat)
 	if err != nil {
 		logger.Errorf("Could not resize {%v} file system of {%v} , error: %v", existingFormat, device, err)
 		return nil, status.Error(codes.Internal, err.Error())

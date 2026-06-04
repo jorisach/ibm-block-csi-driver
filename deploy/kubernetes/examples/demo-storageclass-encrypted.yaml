@@ -1,0 +1,39 @@
+# Example StorageClass with LUKS encryption enabled
+#
+# This StorageClass creates encrypted volumes using LUKS (Linux Unified Key Setup).
+# Volumes will be automatically encrypted when staged on nodes.
+#
+# Prerequisites:
+#   1. Create an encryption secret (see demo-encryption-secret.yaml)
+#   2. Ensure the node DaemonSet has RBAC permissions to read secrets
+#   3. Ensure cryptsetup is installed on nodes
+#
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: ibm-block-encrypted
+provisioner: block.csi.ibm.com
+parameters:
+  # Standard IBM Block CSI parameters
+  pool: "pool1"
+  SpaceEfficiency: "thin"
+
+  # Encryption parameters
+  encrypted: "true"
+  encryptionSecret: "luks-passphrase"
+  encryptionSecretNamespace: "kube-system"
+
+  # CSI secret reference (array credentials)
+  csi.storage.k8s.io/provisioner-secret-name: "ibm-block-csi-driver"
+  csi.storage.k8s.io/provisioner-secret-namespace: "kube-system"
+  csi.storage.k8s.io/controller-publish-secret-name: "ibm-block-csi-driver"
+  csi.storage.k8s.io/controller-publish-secret-namespace: "kube-system"
+
+# Volume binding mode - can be Immediate or WaitForFirstConsumer
+volumeBindingMode: WaitForFirstConsumer
+
+# Allow volume expansion
+allowVolumeExpansion: true
+
+# Reclaim policy - Retain or Delete
+reclaimPolicy: Delete

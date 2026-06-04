@@ -656,7 +656,7 @@ def _generate_volumes_response(new_volumes):
     return volumes
 
 
-def _generate_volume_response(new_volume, system_id=None, source_type=None):
+def _generate_volume_response(new_volume, system_id=None, source_type=None, volume_context=None):
     content_source = None
     if new_volume.source_id:
         if source_type == servers_settings.SNAPSHOT_TYPE_NAME:
@@ -666,10 +666,14 @@ def _generate_volume_response(new_volume, system_id=None, source_type=None):
             volume_source = csi_pb2.VolumeContentSource.VolumeSource(volume_id=new_volume.source_id)
             content_source = csi_pb2.VolumeContentSource(volume=volume_source)
 
+    # Add volume_context if provided
+    context_dict = volume_context if volume_context else {}
+
     return csi_pb2.Volume(
         capacity_bytes=new_volume.capacity_bytes,
         volume_id=get_volume_id(new_volume, system_id),
-        content_source=content_source)
+        content_source=content_source,
+        volume_context=context_dict)
 
 
 def _generate_volumegroup_volume_response(new_volume, system_id=None):
@@ -684,10 +688,10 @@ def _generate_volumegroup_volume_response(new_volume, system_id=None):
         content_source=content_source)
 
 
-def generate_csi_create_volume_response(new_volume, system_id=None, source_type=None):
+def generate_csi_create_volume_response(new_volume, system_id=None, source_type=None, volume_context=None):
     logger.debug("creating create volume response for volume : {0}".format(new_volume))
 
-    response = csi_pb2.CreateVolumeResponse(volume=_generate_volume_response(new_volume, system_id, source_type))
+    response = csi_pb2.CreateVolumeResponse(volume=_generate_volume_response(new_volume, system_id, source_type, volume_context))
 
     logger.debug("finished creating volume response : {0}".format(response))
     return response

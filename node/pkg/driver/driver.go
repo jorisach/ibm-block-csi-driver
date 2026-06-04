@@ -27,6 +27,7 @@ import (
 
 	"github.com/ibm/ibm-block-csi-driver/node/pkg/driver/device_connectivity"
 	"github.com/ibm/ibm-block-csi-driver/node/pkg/driver/executer"
+	"github.com/ibm/ibm-block-csi-driver/node/pkg/driver/luks"
 	mountwrapper "github.com/ibm/ibm-block-csi-driver/node/pkg/driver/mount"
 	"google.golang.org/grpc"
 	yaml "gopkg.in/yaml.v2"
@@ -41,6 +42,11 @@ type Driver struct {
 	config   ConfigFile
 	// csi.UnimplementedIdentityServer
 	// csi.UnimplementedNodeServer
+}
+
+// NewLuksManager creates a new LUKS manager instance
+func NewLuksManager() LuksInterface {
+	return luks.NewLuksManager()
 }
 
 func NewDriver(endpoint string, configFilePath string, hostname string, max_invocations int, clean_scsi_device bool) (*Driver, error) {
@@ -65,10 +71,11 @@ func NewDriver(endpoint string, configFilePath string, hostname string, max_invo
 		configFile.Connectivity_type.Iscsi:        device_connectivity.NewOsDeviceConnectivityIscsi(executer, clean_scsi_device),
 	}
 	osDeviceConnectivityHelper := device_connectivity.NewOsDeviceConnectivityHelperScsiGeneric(executer, clean_scsi_device)
+	luksManager := NewLuksManager()
 	return &Driver{
 		endpoint:    endpoint,
 		config:      configFile,
-		NodeService: NewNodeService(configFile, hostname, *NewNodeUtils(executer, mounter, configFile, osDeviceConnectivityHelper), osDeviceConnectivityMapping, osDeviceConnectivityHelper, executer, mounter, syncLock),
+		NodeService: NewNodeService(configFile, hostname, *NewNodeUtils(executer, mounter, configFile, osDeviceConnectivityHelper), osDeviceConnectivityMapping, osDeviceConnectivityHelper, executer, mounter, syncLock, luksManager),
 	}, nil
 }
 

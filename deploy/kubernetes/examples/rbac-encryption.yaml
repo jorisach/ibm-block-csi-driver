@@ -1,0 +1,35 @@
+# RBAC permissions for IBM Block CSI Node to read encryption secrets
+#
+# The node component needs to read Kubernetes Secrets to retrieve LUKS
+# encryption passphrases during volume staging operations.
+#
+# This manifest grants the necessary permissions to the node ServiceAccount.
+#
+# Prerequisites:
+#   - The ibm-block-csi-node ServiceAccount must exist in your CSI driver namespace
+#   - Update the namespace in the ClusterRoleBinding subjects section if needed
+#
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: ibm-block-csi-node-secret-reader
+rules:
+# Permission to read secrets for LUKS encryption passphrases
+- apiGroups: [""]
+  resources: ["secrets"]
+  verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: ibm-block-csi-node-secret-binding
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: ibm-block-csi-node-secret-reader
+subjects:
+# Update namespace if your CSI driver is deployed in a different namespace
+- kind: ServiceAccount
+  name: ibm-block-csi-node
+  namespace: kube-system

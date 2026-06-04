@@ -1,0 +1,23 @@
+# Example PersistentVolumeClaim using encrypted StorageClass
+#
+# This PVC will create an encrypted volume using LUKS encryption.
+# The volume will be encrypted at rest on the storage array and the
+# LUKS layer provides additional encryption at the host level.
+#
+# Prerequisites:
+#   - demo-encryption-secret.yaml applied
+#   - demo-storageclass-encrypted.yaml applied
+#   - RBAC permissions for node to read secrets
+#
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: demo-pvc-encrypted
+  namespace: default
+spec:
+  accessModes:
+  - ReadWriteOnce
+  resources:
+    requests:
+      storage: 10Gi
+  storageClassName: ibm-block-encrypted
